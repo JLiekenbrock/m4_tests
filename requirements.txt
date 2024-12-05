@@ -2,3 +2,4 @@ datasetsforecast
 statsforecast
 utilsforecast
 seaborn
+neuralforecast
