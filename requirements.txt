@@ -4,3 +4,9 @@ utilsforecast
 seaborn
 neuralforecast
 prophet
+transformers==4.40.1 
+accelerate
+scikit-learn
+chronos-forecasting
+lightgbm
+mlforecast
