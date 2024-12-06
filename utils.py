@@ -68,65 +68,73 @@ def format_input(train,input_length):
                 .agg({'y': lambda x: x.tolist()})
     )    
 
-class chronosPredictor:
-    def __init__(self,input_length):
+import torch
+import numpy as np
+
+class LLM:
+    def __init__(self, input_length, device):
+        """
+        Base class for LLM-based predictors.
+        """
+        self.input_length = input_length
+        self.device = device
+
+    def preprocess_data(self, train):
+        """
+        Preprocess data for input to the model.
+        To be implemented in subclasses.
+        """
+        raise NotImplementedError("Subclasses must implement this method.")
+
+    def predict(self, train, test, h):
+        """
+        Generate predictions.
+        To be implemented in subclasses.
+        """
+        raise NotImplementedError("Subclasses must implement this method.")
+
+class chronosPredictor(LLM):
+    def __init__(self, input_length, device):
+        super().__init__(input_length, device)
         self.pipeline = BaseChronosPipeline.from_pretrained(
             "amazon/chronos-bolt-base",
-            device_map="mps", 
+            device_map=device, 
             torch_dtype=torch.float32,
         )
-        self.input_length = input_length
 
-    def preprocess_data(self,train):
-
+    def preprocess_data(self, train):
         vals = format_input(train, self.input_length)
-
         return [torch.tensor(val) for val in vals["y"]]
 
-    def predict(self,train,test,h):
-        
+    def predict(self, train, test, h):
         data = self.preprocess_data(train)
-        
         prediction = self.pipeline.predict_quantiles(context=data, prediction_length=h, quantile_levels=[0.5])
-
-        fc = (([el.numpy() for pred in prediction for el in pred]))[len(data):]
+        fc = ([el.numpy() for pred in prediction for el in pred])[len(data):]
         fc = np.concatenate(fc)
-
         print(len(fc))
         return format_prediction(fc, test, str(type(self).__name__))
 
-
-class TimeMoEPredictor:
-    def __init__(self,input_length):
-        # Load the model
+class TimeMoEPredictor(LLM):
+    def __init__(self, input_length, device):
+        super().__init__(input_length, device)
         self.model = AutoModelForCausalLM.from_pretrained(
             'Maple728/TimeMoE-50M',
-            device_map = 'cpu',
+            device_map=device,
             trust_remote_code=True
-        )
-        self.input_length = input_length
+        ).to(self.device)
 
-    def preprocess_data(self,train):
-              
-        vals = format_input(train,self.input_length)
-        
+    def preprocess_data(self, train):
+        vals = format_input(train, self.input_length)
         values_tensor = torch.tensor(vals["y"].tolist())
-        
         mean = values_tensor.mean(dim=-1, keepdim=True)
         std = values_tensor.std(dim=-1, keepdim=True)
         normed_seqs = (values_tensor - mean) / std
-                
         return normed_seqs, mean, std
 
     def predict(self, train, test, h):
-
         normed_seqs, mean, std = self.preprocess_data(train)
-
         output = self.model.generate(normed_seqs, max_new_tokens=h)
-        
         print(len(output))
-
-        normed_predictions = output[:, -h:]
+        normed_predictions = output[:, -h:].to('cpu')
         predictions = normed_predictions * std + mean
-
         return format_prediction(predictions.numpy().ravel(), test, str(type(self).__name__))
