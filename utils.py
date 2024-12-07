@@ -8,6 +8,7 @@ np.random.seed(42)
 
 def prepare_data(sample_size=1000,series_cutoff=48):
     group = 'Monthly'
+
     df, *_ = M4.load(directory='data', group=group)
     
     groups = np.random.choice(df["unique_id"].unique(), size=sample_size, replace=False)
@@ -19,7 +20,7 @@ def prepare_data(sample_size=1000,series_cutoff=48):
     dates = (
         dates[ (dates["SP"]=="Monthly") & (dates["M4id"].isin(groups)) & (dates["StartingDate"].str.len()==14)]
             .assign(StartingDate = lambda x : pd.to_datetime(x["StartingDate"]))
-            .loc[lambda df: df["StartingDate"]<'2020-01-01']#
+            .loc[lambda df: df["StartingDate"]<'2020-01-01']
             .rename(columns = {"M4id":"unique_id"})
     )
 
@@ -31,6 +32,7 @@ def prepare_data(sample_size=1000,series_cutoff=48):
             .assign(
                 ds = lambda x : pd.to_datetime((x["StartingDate"] + pd.to_timedelta(x["row"]*30, unit='D')).dt.date+pd.offsets.MonthEnd(0))
                 )
+            .dropna(subset="ds")
             .reset_index()
     )
 
@@ -45,6 +47,36 @@ def prepare_data(sample_size=1000,series_cutoff=48):
     test.to_csv("test.csv")
 
     return train, test
+
+def wape(
+    df:  pd.DataFrame,
+    models: list[str],
+    id_col: str = "unique_id",
+    target_col: str = "y",
+) ->  pd.DataFrame:
+    """Weighted Absolute Percentage Error (WAPE)
+
+    WAPE measures the relative prediction
+    accuracy of a forecasting method by calculating the percentual deviation
+    of the prediction and the observed value at a given time and
+    averages these devations over the length of the series.
+    The closer to zero an observed value is, the higher penalty WAPE loss
+    assigns to the corresponding error."""
+    if isinstance(df, pd.DataFrame):
+        res = (
+            df[models]
+            .sub(df[target_col], axis=0)
+            .abs()
+            .groupby(df[id_col], observed=True)
+            .sum()
+            .div(
+                 (df[models]
+                .abs()
+                .groupby(df[id_col], observed=True).sum()), axis=0)
+            )
+        res.index.name = id_col
+        res = res.reset_index()
+    return res
 
 def format_prediction(prediction,test,model_name):
     return (
