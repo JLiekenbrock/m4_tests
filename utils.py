@@ -135,7 +135,7 @@ import torch
 import numpy as np
 
 class LLM:
-    def __init__(self, input_length, device, test, h):
+    def __init__(self, input_length, device):
         """
         Base class for LLM-based predictors.
         """
@@ -143,9 +143,6 @@ class LLM:
         self.device = device
         self.pred_proba = None
         self.trained_ = False
-        self.trained_ = True
-        self.h = h
-        self.test = test
 
     def preprocess_data(self, train):
         """
@@ -170,10 +167,6 @@ class chronosPredictor(LLM):
             device_map=device, 
             torch_dtype=torch.float32,
         )
-    
-    def fit(self, train, test, h):
-        print("already done")
-        self.trained_ = True
 
     def preprocess_data(self, train):
         vals = format_input(train, self.input_length)
@@ -184,7 +177,6 @@ class chronosPredictor(LLM):
         prediction = self.pipeline.predict_quantiles(context=data, prediction_length=h, quantile_levels=[0.5])
         fc = ([el.numpy() for pred in prediction for el in pred])[len(data):]
         fc = np.concatenate(fc)
-        print(len(fc))
         return format_prediction(fc, test, str(type(self).__name__))
     
     def __sklearn_is_fitted__(self):
@@ -195,8 +187,8 @@ class chronosPredictor(LLM):
 
 
 class TimeMoEPredictor(LLM):
-    def __init__(self, input_length, device, test, h):
-        super().__init__(input_length, device, test, h)
+    def __init__(self, input_length, device):
+        super().__init__(input_length, device)
         self.model = AutoModelForCausalLM.from_pretrained(
             'Maple728/TimeMoE-50M',
             device_map=device,
@@ -224,15 +216,14 @@ class TimeMoEPredictor(LLM):
 
 
 
-    def predict(self, X):
+    def predict(self, X, test, h):
         normed_seqs, mean, std = self.preprocess_data(X)
-        output = self.model.generate(normed_seqs, max_new_tokens=self.h)
+        output = self.model.generate(normed_seqs, max_new_tokens=h)
         print(len(output))
-        normed_predictions = output[:, -self.h:].to('cpu')
+        normed_predictions = output[:, -h:].to('cpu')
         predictions = normed_predictions * std + mean
 
-        #return format_prediction(predictions.numpy().ravel(), self.test, str(type(self).__name__))
-        return (predictions.numpy().ravel())
+        return format_prediction(predictions.numpy().ravel(), test, str(type(self).__name__))
 
     def __sklearn_is_fitted__(self):
         if self.trained_:
