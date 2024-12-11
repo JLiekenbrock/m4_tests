@@ -150,7 +150,7 @@ class prophet_wrapper():
 
         self.model.fit(df)
             
-    def predict(self,h,freq):
+    def predict(self,h):
 
         data = self.model.make_future_dataframe(periods=h, include_history=False, freq='M')
         
@@ -163,26 +163,31 @@ class prophet_forecast:
             self.models[item] = model_wrapper(**args)
 
     def _fit_single_model(self, model, data_subset):
-            model.fit(data_subset)
+        self.models[model].fit(data_subset)
     
-    def _predict_single_model(self, model, data_subset):
-        model.predict(data_subset)
+    def _predict_single_model(self, model, h):
+        model.predict(h)
             
     def fit(self,df):
-        print( self.models.keys())
         data_groups = [df[df["unique_id"] == index] for index in self.models.keys()]
         
         with Pool(cpu_count()) as pool:
-            pool.starmap(self._fit_single_model, zip(self.models.values(), data_groups))
+            pool.starmap(self._fit_single_model, zip(self.models.keys(), data_groups))
 
-    def predict(self, df):
+    def format_prediction(forecasts,test):
+        return (
+            pd.concat([test[["unique_id","y"]].reset_index(),pd.concat(forecasts).reset_index()],axis=1)
+                .drop(columns="index")
+                .rename(columns = {"yhat":"Prophet","yhat_upper":"Prophet-hi-95","yhat_lower":"Prophet-lo-95"})
+                [["unique_id", "ds", "prophet","Prophet-hi-95","Prophet-lo-95"]]
+        )
         
-        data_groups = [df[df["unique_id"] == index] for index in self.models.keys()]
-        
+    def predict(self, test, h):
+                
         with Pool(cpu_count()) as pool:
-            forecasts = pool.starmap(self._predict_single_model, zip(self.models.values(), data_groups))
+            forecasts = pool.starmap(self._predict_single_model, zip(self.models.values(), [h] * len(self.models)))
 
-        return pd.concat(forecasts)
+        return format_prediction(forecasts,test)
 
 
 
@@ -267,12 +272,9 @@ class TimeMoEPredictor(LLM):
         print("already fitted")
         self.trained_ = True
 
-
-
     def predict(self, X, test, h):
         normed_seqs, mean, std = self.preprocess_data(X)
         output = self.model.generate(normed_seqs, max_new_tokens=h)
-        print(len(output))
         normed_predictions = output[:, -h:].to('cpu')
         predictions = normed_predictions * std + mean
 
