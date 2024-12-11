@@ -5,7 +5,10 @@ from chronos import BaseChronosPipeline
 from datasetsforecast.m4 import M4
 import numpy as np
 np.random.seed(42)
-
+from multiprocessing import cpu_count, Pool # for prophet
+import logging
+logging.getLogger("prophet.plot").disabled = True
+from prophet import Prophet
 
 
 def prepare_data(sample_size=1000,series_cutoff=48, min_series_length=42):
@@ -74,8 +77,8 @@ def prepare_data(sample_size=1000,series_cutoff=48, min_series_length=42):
     train = df[df["test"]==0].sort_values(by=["unique_id","ds"]).drop(columns=["test","max","row","StartingDate"])
     test = df[df["test"]==1].sort_values(by=["unique_id","ds"]).drop(columns=["test","max","row","StartingDate"])
 
-    train.to_csv("train.csv")
-    test.to_csv("test.csv")
+    train.to_csv("train.csv",index=False)
+    test.to_csv("test.csv",index=False)
 
     return train, test
 
@@ -134,6 +137,56 @@ def format_input(train,input_length):
 import torch
 import numpy as np
 
+class prophet_wrapper():
+    
+    def __init__(self, **args):
+        self.model = (
+            Prophet(**args)
+        )
+
+    def fit(self,df):
+
+        df = df.drop(columns='unique_id', axis=1)
+
+        self.model.fit(df)
+            
+    def predict(self,h,freq):
+
+        data = self.model.make_future_dataframe(periods=h, include_history=False, freq='M')
+        
+        return self.model.predict(data)
+    
+class prophet_forecast:
+    def __init__(self, model_wrapper, data, **args):
+        self.models = {}
+        for index, item in enumerate(list(data["unique_id"].unique())):
+            self.models[item] = model_wrapper(**args)
+
+    def _fit_single_model(self, model, data_subset):
+            model.fit(data_subset)
+    
+    def _predict_single_model(self, model, data_subset):
+        model.predict(data_subset)
+            
+    def fit(self,df):
+        print( self.models.keys())
+        data_groups = [df[df["unique_id"] == index] for index in self.models.keys()]
+        
+        with Pool(cpu_count()) as pool:
+            pool.starmap(self._fit_single_model, zip(self.models.values(), data_groups))
+
+    def predict(self, df):
+        
+        data_groups = [df[df["unique_id"] == index] for index in self.models.keys()]
+        
+        with Pool(cpu_count()) as pool:
+            forecasts = pool.starmap(self._predict_single_model, zip(self.models.values(), data_groups))
+
+        return pd.concat(forecasts)
+
+
+
+
 class LLM:
     def __init__(self, input_length, device):
         """
@@ -162,7 +215,7 @@ class chronosPredictor(LLM):
     def __init__(self, input_length, device):
         super().__init__(input_length, device)
         
-        self.pipeline = BaseChronosPipeline.from_pretrained(
+        self.model = BaseChronosPipeline.from_pretrained(
             "amazon/chronos-bolt-base",
             device_map=device, 
             torch_dtype=torch.float32,
@@ -174,7 +227,7 @@ class chronosPredictor(LLM):
 
     def predict(self, train, test, h):
         data = self.preprocess_data(train)
-        prediction = self.pipeline.predict_quantiles(context=data, prediction_length=h, quantile_levels=[0.5])
+        prediction = self.model.predict_quantiles(context=data, prediction_length=h, quantile_levels=[0.5])
         fc = ([el.numpy() for pred in prediction for el in pred])[len(data):]
         fc = np.concatenate(fc)
         return format_prediction(fc, test, str(type(self).__name__))

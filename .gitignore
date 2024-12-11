@@ -180,3 +180,5 @@ lightning_logs/version_98/events.out.tfevents.1733503610.MPX6162MQ7TW
 lightning_logs/version_98/hparams.yaml
 lightning_logs/version_99/events.out.tfevents.1733503890.MPX6162MQ7TW
 lightning_logs/version_99/hparams.yaml
+test.csv
+train.csv
