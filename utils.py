@@ -67,7 +67,7 @@ def prepare_data(sample_size=1000,series_cutoff=48, min_series_length=42):
 
     df = df.merge(dates,on=["unique_id","row"])
 
-    df = df[df["max"]>42]
+    df = df[df["max"]>min_series_length]
 
     df["test"] = df["row"] > df["max"] -3
 
