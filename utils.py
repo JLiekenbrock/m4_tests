@@ -6,14 +6,38 @@ from datasetsforecast.m4 import M4
 import numpy as np
 np.random.seed(42)
 
-def prepare_data(sample_size=1000,series_cutoff=48):
+
+
+def prepare_data(sample_size=1000,series_cutoff=48, min_series_length=42):
+
+    path = 'data/m4/datasets'
     group = 'Monthly'
 
-    df, *_ = M4.load(directory='data', group=group)
+    def read_and_melt(file):
+        df = pd.read_csv(file)
+        df.columns = ['unique_id'] + list(range(1, df.shape[1]))
+        df = pd.melt(df, id_vars=['unique_id'], var_name='row', value_name='y')
+        df = df.dropna()
+
+        return df
+
+    df_train = read_and_melt(file=f'{path}/{group}-train.csv')
+    df_test = read_and_melt(file=f'{path}/{group}-test.csv')
+
+    len_train = df_train.groupby('unique_id').agg({'row': 'max'}).reset_index()
+
+    len_train.columns = ['unique_id', 'len_serie']
+    df_test = df_test.merge(len_train, on=['unique_id'])
+    df_test['row'] = df_test['row'] + df_test['len_serie']
+    df_test.drop('len_serie', axis=1, inplace=True)
+
+    df = pd.concat([df_train, df_test])
+    df = df.sort_values(['unique_id', 'row']).reset_index(drop=True)
     
     groups = np.random.choice(df["unique_id"].unique(), size=sample_size, replace=False)
 
-    df = df.set_index(["unique_id","ds"]).sort_index().groupby(level=0).tail(series_cutoff)
+    df = df.set_index(["unique_id","row"]).sort_index().groupby(level=0).tail(series_cutoff)
+
     df = df.loc[df.index.get_level_values('unique_id').isin(groups)].reset_index()
 
     dates = pd.read_csv("data/m4/datasets/M4-info.csv")
@@ -24,24 +48,31 @@ def prepare_data(sample_size=1000,series_cutoff=48):
             .rename(columns = {"M4id":"unique_id"})
     )
 
-    df = (
-        df.set_index("unique_id")
-            .join(dates[["unique_id","StartingDate"]].set_index("unique_id"))
-            .rename(columns={"ds":"row"})
-            .sort_values(by=["unique_id","row"])
-            .assign(
-                ds = lambda x : pd.to_datetime((x["StartingDate"] + pd.to_timedelta(x["row"]*30, unit='D')).dt.date+pd.offsets.MonthEnd(0))
-                )
-            .dropna(subset="ds")
-            .reset_index()
+    dates = (
+        df.groupby("unique_id", as_index=False)["row"].max()
+        .merge(dates[["unique_id", "StartingDate"]], on="unique_id")
+        .assign(
+            ds=lambda x: x.apply(
+                lambda row: pd.date_range(start=row["StartingDate"], periods=row["row"], freq='ME'),
+                axis=1
+            )
+        ) 
+        .explode("ds")  
+        .assign(
+            row = lambda x : x.groupby("unique_id")["StartingDate"].rank(method="first", ascending=True).astype(int)
+        )
     )
 
     df["max"] = df.groupby("unique_id")["row"].transform(max)
 
+    df = df.merge(dates,on=["unique_id","row"])
+
+    df = df[df["max"]>42]
+
     df["test"] = df["row"] > df["max"] -3
 
-    train = df[df["test"]==0].sort_values(by=["unique_id","ds"]).drop(columns=["test","row","max","StartingDate"])
-    test = df[df["test"]==1].sort_values(by=["unique_id","ds"]).drop(columns=["test","row","max","StartingDate"])
+    train = df[df["test"]==0].sort_values(by=["unique_id","ds"]).drop(columns=["test","max","row","StartingDate"])
+    test = df[df["test"]==1].sort_values(by=["unique_id","ds"]).drop(columns=["test","max","row","StartingDate"])
 
     train.to_csv("train.csv")
     test.to_csv("test.csv")
@@ -104,12 +135,17 @@ import torch
 import numpy as np
 
 class LLM:
-    def __init__(self, input_length, device):
+    def __init__(self, input_length, device, test, h):
         """
         Base class for LLM-based predictors.
         """
         self.input_length = input_length
         self.device = device
+        self.pred_proba = None
+        self.trained_ = False
+        self.trained_ = True
+        self.h = h
+        self.test = test
 
     def preprocess_data(self, train):
         """
@@ -128,11 +164,16 @@ class LLM:
 class chronosPredictor(LLM):
     def __init__(self, input_length, device):
         super().__init__(input_length, device)
+        
         self.pipeline = BaseChronosPipeline.from_pretrained(
             "amazon/chronos-bolt-base",
             device_map=device, 
             torch_dtype=torch.float32,
         )
+    
+    def fit(self, train, test, h):
+        print("already done")
+        self.trained_ = True
 
     def preprocess_data(self, train):
         vals = format_input(train, self.input_length)
@@ -145,16 +186,30 @@ class chronosPredictor(LLM):
         fc = np.concatenate(fc)
         print(len(fc))
         return format_prediction(fc, test, str(type(self).__name__))
+    
+    def __sklearn_is_fitted__(self):
+        if self.trained_:
+            return True
+        else:
+            return False
+
 
 class TimeMoEPredictor(LLM):
-    def __init__(self, input_length, device):
-        super().__init__(input_length, device)
+    def __init__(self, input_length, device, test, h):
+        super().__init__(input_length, device, test, h)
         self.model = AutoModelForCausalLM.from_pretrained(
             'Maple728/TimeMoE-50M',
             device_map=device,
             trust_remote_code=True
         ).to(self.device)
 
+    def get_params(self,deep=True):
+        return (
+            {
+                "input_length": self.input_length,
+                "device": self.device
+            }
+        )
     def preprocess_data(self, train):
         vals = format_input(train, self.input_length)
         values_tensor = torch.tensor(vals["y"].tolist())
@@ -163,10 +218,24 @@ class TimeMoEPredictor(LLM):
         normed_seqs = (values_tensor - mean) / std
         return normed_seqs, mean, std
 
-    def predict(self, train, test, h):
-        normed_seqs, mean, std = self.preprocess_data(train)
-        output = self.model.generate(normed_seqs, max_new_tokens=h)
+    def fit(self):
+        print("already fitted")
+        self.trained_ = True
+
+
+
+    def predict(self, X):
+        normed_seqs, mean, std = self.preprocess_data(X)
+        output = self.model.generate(normed_seqs, max_new_tokens=self.h)
         print(len(output))
-        normed_predictions = output[:, -h:].to('cpu')
+        normed_predictions = output[:, -self.h:].to('cpu')
         predictions = normed_predictions * std + mean
-        return format_prediction(predictions.numpy().ravel(), test, str(type(self).__name__))
+
+        #return format_prediction(predictions.numpy().ravel(), self.test, str(type(self).__name__))
+        return (predictions.numpy().ravel())
+
+    def __sklearn_is_fitted__(self):
+        if self.trained_:
+            return True
+        else:
+            return False

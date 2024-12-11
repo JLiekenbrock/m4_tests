@@ -10,3 +10,6 @@ scikit-learn
 chronos-forecasting
 lightgbm
 mlforecast
+mapie
+sktime
+pytorch-forecasting
