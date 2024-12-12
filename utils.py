@@ -65,7 +65,8 @@ def prepare_data(sample_size=1000,series_cutoff=48, min_series_length=42):
         ) 
         .explode("ds")  
         .assign(
-            row = lambda x : x.groupby("unique_id")["StartingDate"].rank(method="first", ascending=True).astype(int)
+            row = lambda x : x.groupby("unique_id")["StartingDate"].rank(method="first", ascending=True).astype(int),
+            ds = lambda x : pd.to_datetime(x["ds"])
         )
     )
 
@@ -114,28 +115,6 @@ def wape(
         res.index.name = id_col
         res = res.reset_index()
     return res
-
-def format_prediction(prediction,test,model_name):
-    return (
-        pd.concat( [
-                        test[["unique_id","ds"]].reset_index(drop=True), 
-                        pd.DataFrame(prediction).reset_index(drop=True)
-                    ]
-                        ,ignore_index=True, axis=1
-            )
-            .rename(columns={0:"unique_id",1:"ds",2:model_name})
-
-    )
-
-def format_input(train,input_length):
-    return (
-         train
-                .sort_values(by=["unique_id","ds"])
-                .groupby("unique_id")
-                .tail(input_length)
-                .groupby("unique_id")
-                .agg({'y': lambda x: x.tolist()})
-    )    
 
 class ProphetForecast:
     def __init__(self, data, **args):
@@ -216,6 +195,27 @@ class LLM:
         To be implemented in subclasses.
         """
         raise NotImplementedError("Subclasses must implement this method.")
+    
+
+    def format_prediction(self, prediction, test):
+        return (
+            pd.concat( [
+                            test[["unique_id","ds"]].reset_index(drop=True), 
+                            prediction.reset_index(drop=True)
+                        ]
+                        ,axis=1
+                )
+        )
+
+    def format_input(self, train, input_length):
+        return (
+            train
+                    .sort_values(by=["unique_id","ds"])
+                    .groupby("unique_id")
+                    .tail(input_length)
+                    .groupby("unique_id")
+                    .agg({'y': lambda x: x.tolist()})
+        )    
 
 class ChronosPredictor(LLM):
     def __init__(self, input_length, device):
@@ -228,15 +228,27 @@ class ChronosPredictor(LLM):
         )
 
     def preprocess_data(self, train):
-        vals = format_input(train, self.input_length)
+        vals = self.format_input(train, self.input_length)
         return [torch.tensor(val) for val in vals["y"]]
 
     def predict(self, train, test, h):
+
+        model_name = str(type(self).__name__)
+
+        quantiles = [0.025,0.975]
+
         data = self.preprocess_data(train)
-        prediction = self.model.predict_quantiles(context=data, prediction_length=h, quantile_levels=[0.5])
-        fc = ([el.numpy() for pred in prediction for el in pred])[len(data):]
-        fc = np.concatenate(fc)
-        return format_prediction(fc, test, str(type(self).__name__))
+        quantiles, mean = self.model.predict_quantiles(context=data, prediction_length=h, quantile_levels=quantiles)
+
+        fc = (quantiles.numpy().flatten().reshape(len(mean.numpy().flatten()),len(quantiles)))
+
+        fc = pd.DataFrame({
+            model_name: mean.numpy().flatten(),
+            f"{model_name}-lo-95": fc[:,0].flatten(), 
+            f"{model_name}-hi-95": fc[:,1].flatten() 
+        })
+        
+        return self.format_prediction(fc, test)
     
     def __sklearn_is_fitted__(self):
         if self.trained_:
@@ -262,7 +274,7 @@ class TimeMoEPredictor(LLM):
             }
         )
     def preprocess_data(self, train):
-        vals = format_input(train, self.input_length)
+        vals = self.format_input(train, self.input_length)
         values_tensor = torch.tensor(vals["y"].tolist())
         mean = values_tensor.mean(dim=-1, keepdim=True)
         std = values_tensor.std(dim=-1, keepdim=True)
@@ -274,12 +286,15 @@ class TimeMoEPredictor(LLM):
         self.trained_ = True
 
     def predict(self, X, test, h):
+
+        model_name = str(type(self).__name__)
+        
         normed_seqs, mean, std = self.preprocess_data(X)
         output = self.model.generate(normed_seqs, max_new_tokens=h)
         normed_predictions = output[:, -h:].to('cpu')
-        predictions = normed_predictions * std + mean
+        predictions =  pd.DataFrame({model_name: (normed_predictions * std + mean).numpy().flatten()})
 
-        return format_prediction(predictions.numpy().ravel(), test, str(type(self).__name__))
+        return self.format_prediction(predictions, test)
 
     def __sklearn_is_fitted__(self):
         if self.trained_:
