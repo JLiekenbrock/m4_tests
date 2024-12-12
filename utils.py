@@ -5,11 +5,14 @@ from chronos import BaseChronosPipeline
 from datasetsforecast.m4 import M4
 import numpy as np
 np.random.seed(42)
-from multiprocessing import cpu_count, Pool # for prophet
+from multiprocessing import Pool, cpu_count, Manager
 import logging
 logging.getLogger("prophet.plot").disabled = True
 from prophet import Prophet
-
+import torch
+import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
 
 def prepare_data(sample_size=1000,series_cutoff=48, min_series_length=42):
 
@@ -134,63 +137,61 @@ def format_input(train,input_length):
                 .agg({'y': lambda x: x.tolist()})
     )    
 
-import torch
-import numpy as np
-
-class prophet_wrapper():
-    
-    def __init__(self, **args):
-        self.model = (
-            Prophet(**args)
-        )
-
-    def fit(self,df):
-
-        df = df.drop(columns='unique_id', axis=1)
-
-        self.model.fit(df)
-            
-    def predict(self,h):
-
-        data = self.model.make_future_dataframe(periods=h, include_history=False, freq='M')
-        
-        return self.model.predict(data)
-    
-class prophet_forecast:
-    def __init__(self, model_wrapper, data, **args):
+class ProphetForecast:
+    def __init__(self, data, **args):
+        self.args = args 
         self.models = {}
-        for index, item in enumerate(list(data["unique_id"].unique())):
-            self.models[item] = model_wrapper(**args)
 
-    def _fit_single_model(self, model, data_subset):
-        self.models[model].fit(data_subset)
-    
-    def _predict_single_model(self, model, h):
-        model.predict(h)
+        for index in data["unique_id"].unique():
+            self.models[index] = Prophet(**self.args)
+
+    def _prepare_data(self, data_subset):
+        data_subset = data_subset.drop(columns='unique_id', axis=1)
+        data_subset = data_subset.rename(columns={'date': 'ds', 'target': 'y'})
+        return data_subset
+
+    def _fit_single_model(self, unique_id, data_subset):
+        model = Prophet(**self.args)
+        data_subset = self._prepare_data(data_subset)
+        model.fit(data_subset)
+        return unique_id, model  # Return model for later prediction
+
+    def fit(self, df):
+        data_groups = [df[df["unique_id"] == unique_id] for unique_id in self.models.keys()]
+        
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            future_to_model = {executor.submit(self._fit_single_model, unique_id, data_group): unique_id 
+                               for unique_id, data_group in zip(self.models.keys(), data_groups)}
             
-    def fit(self,df):
-        data_groups = [df[df["unique_id"] == index] for index in self.models.keys()]
-        
-        with Pool(cpu_count()) as pool:
-            pool.starmap(self._fit_single_model, zip(self.models.keys(), data_groups))
+            for future in as_completed(future_to_model):
+                unique_id, model = future.result()
+                self.models[unique_id] = model
 
-    def format_prediction(forecasts,test):
+    def _predict_single_model(self, unique_id, h):
+        model = self.models[unique_id]
+        future = model.make_future_dataframe(periods=h, include_history=False, freq='ME')
+        forecast = model.predict(future)
+        return forecast[['ds', 'yhat', 'yhat_upper', 'yhat_lower']]
+
+    def format_prediction(self, forecasts, test):
+        model_name = str(type(self).__name__)
         return (
-            pd.concat([test[["unique_id","y"]].reset_index(),pd.concat(forecasts).reset_index()],axis=1)
+            pd.concat([test[["unique_id", "y"]].reset_index(), pd.concat(forecasts).reset_index()], axis=1)
                 .drop(columns="index")
-                .rename(columns = {"yhat":"Prophet","yhat_upper":"Prophet-hi-95","yhat_lower":"Prophet-lo-95"})
-                [["unique_id", "ds", "prophet","Prophet-hi-95","Prophet-lo-95"]]
+                .rename(columns={"yhat": model_name , "yhat_upper": f"{model_name}-hi-95", "yhat_lower": f"{model_name}-lo-95"})
+                [["unique_id", "ds", model_name, f"{model_name}-hi-95", f"{model_name}-lo-95"]]
         )
-        
+
     def predict(self, test, h):
-                
-        with Pool(cpu_count()) as pool:
-            forecasts = pool.starmap(self._predict_single_model, zip(self.models.values(), [h] * len(self.models)))
-
-        return format_prediction(forecasts,test)
-
-
-
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            future_to_model = {executor.submit(self._predict_single_model, unique_id, h): unique_id
+                               for unique_id in self.models.keys()}
+            
+            forecasts = []
+            for future in as_completed(future_to_model):
+                forecasts.append(future.result())
+        
+        return self.format_prediction(forecasts, test)
 
 class LLM:
     def __init__(self, input_length, device):
@@ -216,7 +217,7 @@ class LLM:
         """
         raise NotImplementedError("Subclasses must implement this method.")
 
-class chronosPredictor(LLM):
+class ChronosPredictor(LLM):
     def __init__(self, input_length, device):
         super().__init__(input_length, device)
         
