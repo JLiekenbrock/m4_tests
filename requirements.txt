@@ -13,3 +13,7 @@ mlforecast
 mapie
 sktime
 pytorch-forecasting
+torch
+numpy 
+matplotlib 
+shap
